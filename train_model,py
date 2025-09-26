@@ -1,0 +1,242 @@
+# pip install tensorflow opencv-python mediapipe scikit-learn
+
+# --- Bibliotecas e Módulos Importados ---
+import cv2  # OpenCV para processamento de vídeo e imagem
+import numpy as np  # NumPy para operações numéricas, especialmente com arrays
+import os  # Módulo 'os' para interagir com o sistema operacional (ex: navegar por pastas)
+from sklearn.model_selection import train_test_split  # Para dividir os dados em treino e teste
+from tensorflow.keras.utils import to_categorical  # Para converter rótulos em formato one-hot encoding
+from tensorflow.keras.models import Sequential  # Modelo sequencial do Keras para construir a rede neural
+from tensorflow.keras.layers import GRU, Dense  # Tipos de camadas da rede (GRU para sequências, Densa para classificação)
+from tensorflow.keras.callbacks import TensorBoard  # Callback para visualizar o treinamento no TensorBoard
+import tensorflow as tf  # Biblioteca principal do TensorFlow
+import mediapipe as mp  # Biblioteca do Google para detecção de corpo, mãos, etc.
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe import solutions
+from mediapipe.framework.formats import landmark_pb2
+import warnings
+
+# Suprime avisos de depreciação do MediaPipe para manter o output limpo
+warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf.symbol_database')
+
+# --- Seção 1: Constantes de Configuração ---
+# É uma boa prática definir parâmetros importantes como constantes no início do script.
+
+# Caminho para a pasta principal que contém as subpastas com os vídeos de cada ação.
+DATA_PATH = "videos" # Mudar aqui
+# Define as classes/ações que o modelo aprenderá a reconhecer.
+ACTIONS = np.array(['obrigado', 'null'])
+# Define o número fixo de frames que cada amostra de vídeo terá. Essencial para a entrada da rede neural.
+SEQUENCE_LENGTH = 100
+# Nome do arquivo do modelo Keras que será salvo.
+KERAS_MODEL_NAME = 'asl_action_recognizer.h5'
+# Nome do arquivo do modelo TensorFlow Lite que será salvo (otimizado para mobile/edge).
+TFLITE_MODEL_NAME = 'asl_model.tflite'
+# Caminho para os arquivos de modelo do MediaPipe.
+POSE_MODEL_PATH = 'pose_landmarker_lite.task'
+HAND_MODEL_PATH = 'hand_landmarker.task'
+
+# Verifica se os modelos do MediaPipe existem, caso contrário, encerra o script.
+if not os.path.exists(POSE_MODEL_PATH) or not os.path.exists(HAND_MODEL_PATH):
+    print("="*80)
+    print("ERRO: Por favor, baixe os modelos do MediaPipe (.task) e coloque-os neste diretório.")
+    exit()
+
+# Configuração dos detectores (Landmarkers) do MediaPipe.
+base_options = python.BaseOptions
+PoseLandmarker = vision.PoseLandmarker
+PoseLandmarkerOptions = vision.PoseLandmarkerOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+VisionRunningMode = vision.RunningMode
+
+# Define as opções para o detector de pose.
+# O modo 'IMAGE' é usado para processar cada frame do vídeo individualmente de forma síncrona.
+pose_options = PoseLandmarkerOptions(
+    base_options=base_options(model_asset_path=POSE_MODEL_PATH),
+    running_mode=VisionRunningMode.IMAGE)
+
+# Define as opções para o detector de mãos, permitindo a detecção de até 2 mãos.
+hand_options = HandLandmarkerOptions(
+    base_options=base_options(model_asset_path=HAND_MODEL_PATH),
+    running_mode=VisionRunningMode.IMAGE,
+    num_hands=2)
+
+
+# --- Seção 2: Função de Extração de Pontos-Chave ---
+
+def extract_keypoints(pose_result, hand_result):
+    """
+    Extrai os pontos-chave (landmarks) do corpo e das mãos a partir dos resultados do MediaPipe
+    e os concatena em um único array NumPy.
+    """
+    # Extrai os 33 pontos da pose. Se nenhuma pose for detectada, cria um array de zeros.
+    # Cada ponto tem 4 valores: x, y, z, e visibilidade. Total = 33 * 4 = 132 features.
+    pose = np.array([[res.x, res.y, res.z, res.visibility] for res in pose_result.pose_landmarks[0]]).flatten() if pose_result.pose_landmarks else np.zeros(33 * 4)
+
+    # Inicializa arrays de zeros para os 21 pontos de cada mão.
+    # Cada ponto tem 3 valores: x, y, z. Total por mão = 21 * 3 = 63 features.
+    lh, rh = np.zeros(21 * 3), np.zeros(21 * 3)
+    
+    # Se mãos forem detectadas, preenche os arrays correspondentes.
+    if hand_result.hand_landmarks:
+        for i, hand_landmarks in enumerate(hand_result.hand_landmarks):
+            # Verifica se é a mão esquerda ou direita.
+            handedness = hand_result.handedness[i][0].category_name
+            if handedness == "Left":
+                lh = np.array([[res.x, res.y, res.z] for res in hand_landmarks]).flatten()
+            elif handedness == "Right":
+                rh = np.array([[res.x, res.y, res.z] for res in hand_landmarks]).flatten()
+                
+    # Concatena os arrays de pose, mão esquerda e mão direita em um único vetor de características.
+    return np.concatenate([pose, lh, rh])
+
+
+# --- Seção 3: Processamento de Vídeos e Carregamento de Dados ---
+
+def process_videos_and_load_data():
+    """
+    Varre as pastas de vídeos, extrai os pontos-chave de cada frame, normaliza o tamanho
+    das sequências e prepara os dados (X) e rótulos (y) para o treinamento.
+    """
+    print("Iniciando processamento de vídeos e carregamento de dados...")
+    # Mapeia cada nome de ação para um número (ex: 'obrigado' -> 0, 'null' -> 1).
+    label_map = {label: num for num, label in enumerate(ACTIONS)}
+    sequences, labels = [], []
+
+    # Utiliza 'with' para garantir que os recursos do MediaPipe sejam liberados corretamente.
+    with PoseLandmarker.create_from_options(pose_options) as pose_landmarker, \
+         HandLandmarker.create_from_options(hand_options) as hand_landmarker:
+
+        # Itera sobre cada ação definida (ex: 'obrigado', 'null').
+        for action in ACTIONS:
+            action_path = os.path.join(DATA_PATH, action)
+            if not os.path.isdir(action_path):
+                print(f"Aviso: Diretório não encontrado para a ação '{action}': {action_path}")
+                continue
+
+            print(f"Processando vídeos para a ação: '{action}'")
+            # Itera sobre cada arquivo de vídeo na pasta da ação.
+            for video_file in os.listdir(action_path):
+                if not video_file.lower().endswith('.mp4'):
+                    continue
+
+                video_path = os.path.join(action_path, video_file)
+                cap = cv2.VideoCapture(video_path)
+
+                frame_landmarks = []
+                # Loop para ler cada frame do vídeo.
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break  # Fim do vídeo.
+
+                    # Converte o frame do formato BGR (OpenCV) para RGB e depois para o formato do MediaPipe.
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+                    # Executa a detecção de pose e mãos no frame atual.
+                    pose_result = pose_landmarker.detect(mp_image)
+                    hand_result = hand_landmarker.detect(mp_image)
+
+                    # Extrai os pontos-chave e os adiciona à lista de frames do vídeo.
+                    keypoints = extract_keypoints(pose_result, hand_result)
+                    frame_landmarks.append(keypoints)
+
+                cap.release()
+
+                # Após processar todos os frames, normaliza o comprimento da sequência.
+                if len(frame_landmarks) > 0:
+                    # Se o vídeo for mais longo que SEQUENCE_LENGTH, seleciona frames uniformemente.
+                    if len(frame_landmarks) >= SEQUENCE_LENGTH:
+                        indices = np.linspace(0, len(frame_landmarks) - 1, SEQUENCE_LENGTH, dtype=int)
+                        sampled_landmarks = [frame_landmarks[i] for i in indices]
+                    # Se o vídeo for mais curto, preenche com o último frame até atingir o comprimento.
+                    else:
+                        sampled_landmarks = frame_landmarks
+                        padding = [frame_landmarks[-1]] * (SEQUENCE_LENGTH - len(frame_landmarks))
+                        sampled_landmarks.extend(padding)
+                    
+                    # Adiciona a sequência normalizada e seu rótulo às listas principais.
+                    sequences.append(sampled_landmarks)
+                    labels.append(label_map[action])
+
+    # Converte as listas para arrays NumPy e os rótulos para o formato one-hot.
+    return np.array(sequences), to_categorical(labels).astype(int)
+
+
+# --- Seção 4: Treinamento do Modelo ---
+
+def train_model():
+    """
+    Carrega os dados, define a arquitetura da rede neural, compila, treina
+    e salva os modelos finalizados.
+    """
+    # Carrega e processa os dados dos vídeos.
+    X, y = process_videos_and_load_data()
+
+    # Verifica se algum dado foi carregado antes de prosseguir.
+    if X.shape[0] == 0:
+        print("Erro: Nenhum dado foi carregado. Verifique o DATA_PATH e os arquivos de vídeo.")
+        return
+
+    # Divide os dados em 85% para treino e 15% para teste/validação.
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15)
+
+    print(f"\nDados carregados e processados com sucesso.")
+    print(f"Shape dos dados de treino: {X_train.shape}")
+    print(f"Shape dos dados de teste: {X_test.shape}")
+
+    # Configura o TensorBoard para monitorar o treinamento.
+    log_dir = os.path.join('Logs')
+    tb_callback = TensorBoard(log_dir=log_dir)
+
+    # Define o número de features de entrada (132 da pose + 63 da mão esquerda + 63 da mão direita).
+    num_features = 258
+
+    # Define a arquitetura do modelo sequencial.
+    model = Sequential([
+        # Camadas GRU para aprender padrões temporais. 'return_sequences=True' é necessário
+        # para passar a sequência completa para a próxima camada GRU.
+        GRU(64, return_sequences=True, input_shape=(SEQUENCE_LENGTH, num_features)),
+        GRU(128, return_sequences=True),
+        # A última camada GRU não retorna a sequência, apenas o output final.
+        GRU(64, return_sequences=False),
+        # Camadas densas para a classificação final.
+        Dense(64, activation='relu'),
+        Dense(32, activation='relu'),
+        # Camada de saída com ativação 'softmax' para problemas de classificação multiclasse.
+        Dense(ACTIONS.shape[0], activation='softmax')
+    ])
+
+    # Compila o modelo, definindo o otimizador, a função de perda e as métricas.
+    model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['categorical_accuracy'])
+    # Exibe um resumo da arquitetura do modelo.
+    model.summary()
+
+    print("\nIniciando treinamento do modelo...")
+    # Inicia o processo de treinamento.
+    model.fit(X_train, y_train, epochs=150, callbacks=[tb_callback], validation_data=(X_test, y_test))
+    print("Treinamento do modelo completo.")
+
+    # Salva o modelo treinado no formato padrão do Keras (.h5).
+    model.save(KERAS_MODEL_NAME)
+    
+    # Converte e otimiza o modelo para o formato TensorFlow Lite.
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+
+    # Salva o modelo TFLite em um arquivo binário.
+    with open(TFLITE_MODEL_NAME, 'wb') as f:
+        f.write(tflite_model)
+        
+    print("Modelos salvos com sucesso.")
+
+
+# --- Execução Principal ---
+# O bloco 'if __name__ == "__main__"' garante que o código abaixo só será executado
+# quando o script for rodado diretamente (e não quando for importado como um módulo).
+if __name__ == "__main__":
+    train_model()
+    print("\n✅ --- PROCESSO CONCLUÍDO --- ✅")
