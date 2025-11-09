@@ -6,9 +6,7 @@ import numpy as np  # NumPy para operações numéricas, especialmente com array
 import os  # Módulo 'os' para interagir com o sistema operacional (ex: navegar por pastas)
 from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
 from tensorflow.keras.utils import to_categorical  # Para converter rótulos em formato one-hot encoding
-from tensorflow.keras.models import Sequential  # Modelo sequencial do Keras para construir a rede neural
-from tensorflow.keras.layers import GRU, Dense, Dropout  # Tipos de camadas da rede (GRU para sequências, Densa para classificação)
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint  # Callbacks para melhorar o treinamento
+from tensorflow.keras.models import load_model  # Importa a função para carregar um modelo treinado
 import tensorflow as tf  # Biblioteca principal do TensorFlow
 import mediapipe as mp  # Biblioteca do Google para detecção de corpo, mãos, face, etc.
 from mediapipe.tasks import python
@@ -31,28 +29,33 @@ sns.set_palette("husl")
 # --- Seção 1: Constantes de Configuração ---
 # É uma boa prática definir parâmetros importantes como constantes no início do script.
 
-# Caminhos para as pastas de dados de treino (ex: 4 signers) e teste (ex: 1 signer)
-TRAIN_DATA_PATH = "sinais"
+# Caminho para a pasta de dados de TESTE (ex: novos vídeos, novos signers)
 TEST_DATA_PATH = "teste"
 # Define as classes/ações que o modelo aprenderá a reconhecer.
 ACTIONS = np.array(['obrigado', "tudo_bem", "bom_dia", "qual_seu_nome", 'null'])
 # Define o número fixo de frames que cada amostra de vídeo terá. Essencial para a entrada da rede neural.
 SEQUENCE_LENGTH = 100
-# Nome do arquivo do modelo Keras que será salvo.
+# Nome do arquivo do modelo Keras que será CARREGADO.
 KERAS_MODEL_NAME = 'klibras_model.h5'
 # Diretório para salvar os gráficos e relatórios
-RESULTS_DIR = 'training_results'
+RESULTS_DIR = 'test_results'
 # Caminho para os arquivos de modelo do MediaPipe.
 POSE_MODEL_PATH = 'pose_landmarker_lite.task'
 HAND_MODEL_PATH = 'hand_landmarker.task'
 FACE_MODEL_PATH = 'face_landmarker.task'
-# Número de workers para processamento paralelo (otimizado para g4dn.x2large com 4 vCPUs)
+# Número de workers para processamento paralelo
 NUM_WORKERS = 3  # Deixa 1 CPU livre para o sistema
 
 # Cria o diretório de resultados se não existir
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# Verifica se os modelos do MediaPipe existem, caso contrário, encerra o script.
+# Verifica se os modelos do MediaPipe e o modelo treinado existem
+if not os.path.exists(KERAS_MODEL_NAME):
+    print("="*80)
+    print(f"ERRO: Modelo treinado '{KERAS_MODEL_NAME}' não encontrado.")
+    print("Por favor, execute o script de treino primeiro.")
+    exit()
+
 if not os.path.exists(POSE_MODEL_PATH) or not os.path.exists(HAND_MODEL_PATH) or not os.path.exists(FACE_MODEL_PATH):
     print("="*80)
     print("ERRO: Por favor, baixe os modelos do MediaPipe (.task) e coloque-os neste diretório.")
@@ -185,10 +188,10 @@ def process_single_video(video_info):
     return None
 
 
-def load_data_from_path(data_path):
+def process_test_data(data_path):
     """
     Varre as pastas de vídeos, extrai os pontos-chave de cada frame usando workers paralelos,
-    normaliza o tamanho das sequências e prepara os dados (X) e rótulos (y) para o treinamento.
+    normaliza o tamanho das sequências e prepara os dados (X) e rótulos (y) para o teste.
     """
     print(f"Iniciando processamento de vídeos do diretório: {data_path}")
     print(f"Usando {NUM_WORKERS} workers para processamento paralelo")
@@ -261,67 +264,6 @@ def load_data_from_path(data_path):
 
 # --- Seção 4: Funções de Visualização ---
 
-def plot_training_history(history, timestamp):
-    """
-    Cria gráficos detalhados do histórico de treinamento.
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('📊 Histórico de Treinamento do Modelo LIBRAS', fontsize=16, fontweight='bold')
-    
-    # Gráfico 1: Loss (Treino vs Validação)
-    axes[0, 0].plot(history.history['loss'], label='Treino', linewidth=2, marker='o', markersize=4)
-    axes[0, 0].plot(history.history['val_loss'], label='Validação', linewidth=2, marker='s', markersize=4)
-    axes[0, 0].set_title('Loss ao Longo das Épocas', fontsize=12, fontweight='bold')
-    axes[0, 0].set_xlabel('Época')
-    axes[0, 0].set_ylabel('Loss (Categorical Crossentropy)')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Gráfico 2: Accuracy (Treino vs Validação)
-    axes[0, 1].plot(history.history['categorical_accuracy'], label='Treino', linewidth=2, marker='o', markersize=4)
-    axes[0, 1].plot(history.history['val_categorical_accuracy'], label='Validação', linewidth=2, marker='s', markersize=4)
-    axes[0, 1].set_title('Acurácia ao Longo das Épocas', fontsize=12, fontweight='bold')
-    axes[0, 1].set_xlabel('Época')
-    axes[0, 1].set_ylabel('Acurácia')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_ylim([0, 1])
-    
-    # Gráfico 3: Diferença entre Treino e Validação (Loss)
-    loss_diff = np.array(history.history['loss']) - np.array(history.history['val_loss'])
-    axes[1, 0].plot(loss_diff, linewidth=2, color='red', marker='o', markersize=4)
-    axes[1, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    axes[1, 0].set_title('Gap de Loss (Treino - Validação)', fontsize=12, fontweight='bold')
-    axes[1, 0].set_xlabel('Época')
-    axes[1, 0].set_ylabel('Diferença de Loss')
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].fill_between(range(len(loss_diff)), loss_diff, alpha=0.3, color='red')
-    
-    # Gráfico 4: Learning Rate ao longo do tempo (se disponível)
-    if 'lr' in history.history:
-        axes[1, 1].plot(history.history['lr'], linewidth=2, color='green', marker='o', markersize=4)
-        axes[1, 1].set_title('Taxa de Aprendizado', fontsize=12, fontweight='bold')
-        axes[1, 1].set_xlabel('Época')
-        axes[1, 1].set_ylabel('Learning Rate')
-        axes[1, 1].set_yscale('log')
-        axes[1, 1].grid(True, alpha=0.3)
-    else:
-        # Gráfico alternativo: Diferença de Acurácia
-        acc_diff = np.array(history.history['categorical_accuracy']) - np.array(history.history['val_categorical_accuracy'])
-        axes[1, 1].plot(acc_diff, linewidth=2, color='blue', marker='o', markersize=4)
-        axes[1, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
-        axes[1, 1].set_title('Gap de Acurácia (Treino - Validação)', fontsize=12, fontweight='bold')
-        axes[1, 1].set_xlabel('Época')
-        axes[1, 1].set_ylabel('Diferença de Acurácia')
-        axes[1, 1].grid(True, alpha=0.3)
-        axes[1, 1].fill_between(range(len(acc_diff)), acc_diff, alpha=0.3, color='blue')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, f'training_history_{timestamp}.png'), dpi=300, bbox_inches='tight')
-    print(f"✓ Gráfico de histórico salvo: training_history_{timestamp}.png")
-    plt.close()
-
-
 def plot_confusion_matrix(y_true, y_pred, timestamp):
     """
     Cria uma matriz de confusão normalizada e não-normalizada.
@@ -335,7 +277,7 @@ def plot_confusion_matrix(y_true, y_pred, timestamp):
     cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
     
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    fig.suptitle('🎯 Matriz de Confusão', fontsize=16, fontweight='bold')
+    fig.suptitle('🎯 Matriz de Confusão (Dados de Teste)', fontsize=16, fontweight='bold')
     
     # Matriz de confusão absoluta
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
@@ -354,8 +296,8 @@ def plot_confusion_matrix(y_true, y_pred, timestamp):
     axes[1].set_xlabel('Classe Predita')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, f'confusion_matrix_{timestamp}.png'), dpi=300, bbox_inches='tight')
-    print(f"✓ Matriz de confusão salva: confusion_matrix_{timestamp}.png")
+    plt.savefig(os.path.join(RESULTS_DIR, f'test_confusion_matrix_{timestamp}.png'), dpi=300, bbox_inches='tight')
+    print(f"✓ Matriz de confusão salva: test_confusion_matrix_{timestamp}.png")
     plt.close()
 
 
@@ -371,7 +313,7 @@ def plot_per_class_metrics(y_true, y_pred, timestamp):
     precision, recall, f1, support = precision_recall_fscore_support(y_true_labels, y_pred_labels)
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('📈 Métricas por Classe', fontsize=16, fontweight='bold')
+    fig.suptitle('📈 Métricas por Classe (Dados de Teste)', fontsize=16, fontweight='bold')
     
     x = np.arange(len(ACTIONS))
     width = 0.25
@@ -422,98 +364,65 @@ def plot_per_class_metrics(y_true, y_pred, timestamp):
         axes[1, 1].text(v + 0.02, i, f'{v:.3f}', va='center', fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, f'per_class_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
-    print(f"✓ Métricas por classe salvas: per_class_metrics_{timestamp}.png")
+    plt.savefig(os.path.join(RESULTS_DIR, f'test_per_class_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
+    print(f"✓ Métricas por classe salvas: test_per_class_metrics_{timestamp}.png")
     plt.close()
 
 
-def plot_model_performance_summary(history, y_test, y_pred, timestamp):
+def plot_evaluation_dashboard(y_test, y_pred, test_loss, test_accuracy, timestamp):
     """
-    Cria um dashboard resumido com as principais métricas.
+    Cria um dashboard resumido com as principais métricas de teste.
     """
     fig = plt.figure(figsize=(18, 10))
-    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-    fig.suptitle('🎯 Dashboard de Performance do Modelo LIBRAS', fontsize=18, fontweight='bold')
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+    fig.suptitle('🎯 Dashboard de Performance (Dados de Teste)', fontsize=18, fontweight='bold')
     
-    # 1. Loss final
+    # 1. Acurácia Final
     ax1 = fig.add_subplot(gs[0, 0])
-    final_train_loss = history.history['loss'][-1]
-    final_val_loss = history.history['val_loss'][-1]
-    ax1.bar(['Treino', 'Validação'], [final_train_loss, final_val_loss], color=['#3498db', '#e74c3c'], alpha=0.7)
-    ax1.set_title('Loss Final', fontweight='bold')
-    ax1.set_ylabel('Loss')
-    ax1.grid(True, alpha=0.3, axis='y')
-    for i, v in enumerate([final_train_loss, final_val_loss]):
-        ax1.text(i, v + 0.01, f'{v:.4f}', ha='center', va='bottom', fontweight='bold')
-    
-    # 2. Acurácia final
+    ax1.text(0.5, 0.6, f'{test_accuracy:.2%}', ha='center', va='center', fontsize=48, fontweight='bold', color='#2ecc71')
+    ax1.text(0.5, 0.3, 'Acurácia Geral', ha='center', va='center', fontsize=18, color='#34495e')
+    ax1.set_xlim([0, 1])
+    ax1.set_ylim([0, 1])
+    ax1.axis('off')
+
+    # 2. Loss Final
     ax2 = fig.add_subplot(gs[0, 1])
-    final_train_acc = history.history['categorical_accuracy'][-1]
-    final_val_acc = history.history['val_categorical_accuracy'][-1]
-    ax2.bar(['Treino', 'Validação'], [final_train_acc, final_val_acc], color=['#2ecc71', '#f39c12'], alpha=0.7)
-    ax2.set_title('Acurácia Final', fontweight='bold')
-    ax2.set_ylabel('Acurácia')
+    ax2.text(0.5, 0.6, f'{test_loss:.4f}', ha='center', va='center', fontsize=48, fontweight='bold', color='#e74c3c')
+    ax2.text(0.5, 0.3, 'Loss Geral', ha='center', va='center', fontsize=18, color='#34495e')
+    ax2.set_xlim([0, 1])
     ax2.set_ylim([0, 1])
-    ax2.grid(True, alpha=0.3, axis='y')
-    for i, v in enumerate([final_train_acc, final_val_acc]):
-        ax2.text(i, v + 0.02, f'{v:.2%}', ha='center', va='bottom', fontweight='bold')
+    ax2.axis('off')
     
-    # 3. Número de épocas treinadas
-    ax3 = fig.add_subplot(gs[0, 2])
-    total_epochs = len(history.history['loss'])
-    ax3.text(0.5, 0.5, f'{total_epochs}', ha='center', va='center', fontsize=48, fontweight='bold', color='#9b59b6')
-    ax3.text(0.5, 0.2, 'Épocas\nTreinadas', ha='center', va='center', fontsize=14, color='#34495e')
-    ax3.set_xlim([0, 1])
-    ax3.set_ylim([0, 1])
-    ax3.axis('off')
-    
-    # 4. Curva de Loss (grande)
-    ax4 = fig.add_subplot(gs[1, :])
-    ax4.plot(history.history['loss'], label='Treino', linewidth=2.5, alpha=0.8)
-    ax4.plot(history.history['val_loss'], label='Validação', linewidth=2.5, alpha=0.8)
-    ax4.set_title('Evolução do Loss', fontweight='bold', fontsize=14)
-    ax4.set_xlabel('Época')
-    ax4.set_ylabel('Loss')
-    ax4.legend(fontsize=12)
-    ax4.grid(True, alpha=0.3)
-    ax4.fill_between(range(len(history.history['loss'])), history.history['loss'], alpha=0.2)
-    ax4.fill_between(range(len(history.history['val_loss'])), history.history['val_loss'], alpha=0.2)
-    
-    # 5. Matriz de confusão mini
-    ax5 = fig.add_subplot(gs[2, 0])
+    # 3. Matriz de confusão
+    ax3 = fig.add_subplot(gs[1, 0])
     y_true_labels = np.argmax(y_test, axis=1)
     y_pred_labels = np.argmax(y_pred, axis=1)
     cm = confusion_matrix(y_true_labels, y_pred_labels)
     cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
     sns.heatmap(cm_normalized, annot=True, fmt='.1%', cmap='RdYlGn', 
-                xticklabels=ACTIONS, yticklabels=ACTIONS, ax=ax5, cbar=False, square=True)
-    ax5.set_title('Matriz de Confusão', fontweight='bold')
+                xticklabels=ACTIONS, yticklabels=ACTIONS, ax=ax3, cbar=False, square=True)
+    ax3.set_title('Matriz de Confusão (Normalizada)', fontweight='bold')
     
-    # 6. Métricas por classe
-    ax6 = fig.add_subplot(gs[2, 1:])
+    # 4. F1-Score por Classe
+    ax4 = fig.add_subplot(gs[1, 1])
     precision, recall, f1, _ = precision_recall_fscore_support(y_true_labels, y_pred_labels)
-    x = np.arange(len(ACTIONS))
-    width = 0.25
-    ax6.bar(x - width, precision, width, label='Precision', alpha=0.8)
-    ax6.bar(x, recall, width, label='Recall', alpha=0.8)
-    ax6.bar(x + width, f1, width, label='F1-Score', alpha=0.8)
-    ax6.set_xlabel('Classe')
-    ax6.set_ylabel('Score')
-    ax6.set_title('Métricas por Classe', fontweight='bold')
-    ax6.set_xticks(x)
-    ax6.set_xticklabels(ACTIONS)
-    ax6.legend()
-    ax6.set_ylim([0, 1.1])
-    ax6.grid(True, alpha=0.3, axis='y')
+    ax4.barh(ACTIONS, f1, color='lightcoral', alpha=0.8)
+    ax4.set_xlabel('F1-Score')
+    ax4.set_title('F1-Score por Classe', fontweight='bold')
+    ax4.set_xlim([0, 1])
+    ax4.grid(True, alpha=0.3, axis='x')
+    for i, v in enumerate(f1):
+        ax4.text(v + 0.02, i, f'{v:.3f}', va='center', fontweight='bold')
     
-    plt.savefig(os.path.join(RESULTS_DIR, f'performance_dashboard_{timestamp}.png'), dpi=300, bbox_inches='tight')
-    print(f"✓ Dashboard de performance salvo: performance_dashboard_{timestamp}.png")
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, f'test_performance_dashboard_{timestamp}.png'), dpi=300, bbox_inches='tight')
+    print(f"✓ Dashboard de performance salvo: test_performance_dashboard_{timestamp}.png")
     plt.close()
 
 
-def save_metrics_report(history, y_test, y_pred, timestamp):
+def save_evaluation_report(y_test, y_pred, test_loss, test_accuracy, timestamp):
     """
-    Salva um relatório detalhado em formato JSON e texto.
+    Salva um relatório de avaliação detalhado em formato JSON e texto.
     """
     y_true_labels = np.argmax(y_test, axis=1)
     y_pred_labels = np.argmax(y_pred, axis=1)
@@ -521,214 +430,126 @@ def save_metrics_report(history, y_test, y_pred, timestamp):
     # Gera relatório de classificação
     report = classification_report(y_true_labels, y_pred_labels, target_names=ACTIONS, output_dict=True)
     
-    # Adiciona informações do histórico de treinamento
-    report['training_history'] = {
-        'final_train_loss': float(history.history['loss'][-1]),
-        'final_val_loss': float(history.history['val_loss'][-1]),
-        'final_train_accuracy': float(history.history['categorical_accuracy'][-1]),
-        'final_val_accuracy': float(history.history['val_categorical_accuracy'][-1]),
-        'total_epochs': len(history.history['loss']),
-        'best_val_accuracy': float(max(history.history['val_categorical_accuracy'])),
-        'best_val_accuracy_epoch': int(np.argmax(history.history['val_categorical_accuracy']) + 1)
+    # Adiciona informações da avaliação
+    report['evaluation_metrics'] = {
+        'test_loss': float(test_loss),
+        'test_accuracy': float(test_accuracy),
     }
     
     # Salva como JSON
-    json_path = os.path.join(RESULTS_DIR, f'metrics_report_{timestamp}.json')
+    json_path = os.path.join(RESULTS_DIR, f'test_metrics_report_{timestamp}.json')
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=4, ensure_ascii=False)
     
     # Salva como texto formatado
-    txt_path = os.path.join(RESULTS_DIR, f'metrics_report_{timestamp}.txt')
+    txt_path = os.path.join(RESULTS_DIR, f'test_metrics_report_{timestamp}.txt')
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write("="*80 + "\n")
-        f.write("RELATÓRIO DE MÉTRICAS - MODELO LIBRAS\n")
+        f.write("RELATÓRIO DE AVALIAÇÃO - MODELO LIBRAS (Dados de Teste)\n")
         f.write("="*80 + "\n\n")
         f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Modelo: {KERAS_MODEL_NAME}\n")
+        f.write(f"Modelo Testado: {KERAS_MODEL_NAME}\n")
         f.write(f"Classes: {', '.join(ACTIONS)}\n")
-        f.write(f"Workers utilizados: {NUM_WORKERS}\n")
         
-        f.write("HISTÓRICO DE TREINAMENTO\n")
+        f.write("MÉTRICAS GERAIS\n")
         f.write("-"*80 + "\n")
-        f.write(f"Total de Épocas: {report['training_history']['total_epochs']}\n")
-        f.write(f"Loss Final (Treino): {report['training_history']['final_train_loss']:.4f}\n")
-        f.write(f"Loss Final (Validação): {report['training_history']['final_val_loss']:.4f}\n")
-        f.write(f"Acurácia Final (Treino): {report['training_history']['final_train_accuracy']:.2%}\n")
-        f.write(f"Acurácia Final (Validação): {report['training_history']['final_val_accuracy']:.2%}\n")
-        f.write(f"Melhor Acurácia (Validação): {report['training_history']['best_val_accuracy']:.2%} (Época {report['training_history']['best_val_accuracy_epoch']})\n\n")
+        f.write(f"Loss no conjunto de teste: {test_loss:.4f}\n")
+        f.write(f"Acurácia no conjunto de teste: {test_accuracy:.2%}\n\n")
         
         f.write("RELATÓRIO DE CLASSIFICAÇÃO\n")
         f.write("-"*80 + "\n")
         f.write(classification_report(y_true_labels, y_pred_labels, target_names=ACTIONS))
         f.write("\n")
     
-    print(f"✓ Relatório de métricas salvo: metrics_report_{timestamp}.json e .txt")
+    print(f"✓ Relatório de métricas salvo: test_metrics_report_{timestamp}.json e .txt")
 
 
-# --- Seção 5: Treinamento do Modelo ---
+# --- Seção 5: Avaliação do Modelo ---
 
-def train_model():
+def evaluate_model():
     """
-    Carrega os dados usando workers paralelos, define a arquitetura da rede neural,
-    compila, treina e salva o modelo finalizado em formato H5.
+    Carrega os dados de teste, carrega o modelo treinado,
+    avalia a performance e gera todos os relatórios visuais.
     """
     # Timestamp para identificar esta execução
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Carrega e processa os dados dos vídeos usando workers paralelos
+    # Carrega e processa os dados dos vídeos de teste
     print("\n" + "="*80)
-    print("CARREGANDO DADOS DE TREINO")
-    X_train, y_train = load_data_from_path(TRAIN_DATA_PATH)
-    
-    print("\n" + "="*80)
-    print("CARREGANDO DADOS DE TESTE (VALIDAÇÃO)")
-    X_test, y_test = load_data_from_path(TEST_DATA_PATH)
+    print(f"CARREGANDO DADOS DE TESTE DE '{TEST_DATA_PATH}'")
+    X_test, y_test = process_test_data(TEST_DATA_PATH)
     
     # Verifica se algum dado foi carregado antes de prosseguir
-    if X_train.shape[0] == 0 or X_test.shape[0] == 0:
-        print("Erro: Nenhum dado foi carregado. Verifique os diretórios TRAIN_DATA_PATH e TEST_DATA_PATH.")
+    if X_test.shape[0] == 0:
+        print(f"Erro: Nenhum dado foi carregado de '{TEST_DATA_PATH}'. Verifique o diretório.")
         return
 
     print(f"\n{'='*80}")
-    print(f"Dados carregados e processados com sucesso.")
-    print(f"Shape dos dados de treino: {X_train.shape}")
+    print(f"Dados de teste carregados e processados com sucesso.")
     print(f"Shape dos dados de teste: {X_test.shape}")
-    print(f"Total de amostras de treino: {X_train.shape[0]}")
     print(f"Total de amostras de teste: {X_test.shape[0]}")
-    print(f"Número de classes: {y_train.shape[1]}")
+    print(f"Número de classes: {y_test.shape[1]}")
     print(f"{'='*80}\n")
-
-    # Verifica se GPU está disponível
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        print(f"✓ GPU detectada: {len(gpus)} dispositivo(s)")
-        for gpu in gpus:
-            print(f"  - {gpu}")
-    else:
-        print("⚠ Nenhuma GPU detectada. Treinamento usará CPU.")
-    print()
-
-    # Configura o TensorBoard para monitorar o treinamento
-    log_dir = os.path.join('Logs')
-    tb_callback = TensorBoard(log_dir=log_dir)
     
-    # Early stopping para evitar overfitting
-    early_stopping = EarlyStopping(
-        monitor='val_loss',
-        patience=20,
-        restore_best_weights=True,
-        verbose=1
-    )
-    
-    # Checkpoint para salvar o melhor modelo durante o treinamento
-    checkpoint = ModelCheckpoint(
-        KERAS_MODEL_NAME,
-        monitor='val_categorical_accuracy',
-        save_best_only=True,
-        mode='max',
-        verbose=1
-    )
-
-    # Define o número de features de entrada
-    # 132 (pose) + 63 (mão esquerda) + 63 (mão direita) + 1434 (face) = 1692
-    num_features = 1692
-
-    # Define a arquitetura do modelo sequencial
-    model = Sequential([
-        # Camadas GRU para aprender padrões temporais. 'return_sequences=True' é necessário
-        # para passar a sequência completa para a próxima camada GRU
-        GRU(64, return_sequences=True, input_shape=(SEQUENCE_LENGTH, num_features)),
-        Dropout(0.2),
-        GRU(128, return_sequences=True),
-        Dropout(0.2),
-        # A última camada GRU não retorna a sequência, apenas o output final
-        GRU(64, return_sequences=False),
-        Dropout(0.2),
-        # Camadas densas para a classificação final
-        Dense(64, activation='relu'),
-        Dropout(0.3),
-        Dense(32, activation='relu'),
-        # Camada de saída com ativação 'softmax' para problemas de classificação multiclasse
-        Dense(ACTIONS.shape[0], activation='softmax')
-    ])
-
-    # Compila o modelo, definindo o otimizador, a função de perda e as métricas
-    model.compile(
-        optimizer='Adam',
-        loss='categorical_crossentropy',
-        metrics=['categorical_accuracy']
-    )
-    
-    # Exibe um resumo da arquitetura do modelo
-    print("\n" + "="*80)
-    print("ARQUITETURA DO MODELO")
-    print("="*80)
-    model.summary()
+    # Carrega o modelo H5 treinado
+    print(f"Carregando modelo treinado: {KERAS_MODEL_NAME}...")
+    try:
+        model = load_model(KERAS_MODEL_NAME)
+        print("✓ Modelo carregado com sucesso.")
+        model.summary()
+    except Exception as e:
+        print(f"ERRO AO CARREGAR O MODELO: {str(e)}")
+        return
     print("="*80 + "\n")
 
-    print("Iniciando treinamento do modelo...")
-    print(f"Número de épocas: 150")
-    print(f"Callbacks: TensorBoard, EarlyStopping, ModelCheckpoint\n")
+    print("Iniciando avaliação do modelo nos dados de teste...")
     
-    # Inicia o processo de treinamento
-    history = model.fit(
-        X_train, y_train,
-        epochs=150,
-        callbacks=[tb_callback, early_stopping, checkpoint],
-        validation_data=(X_test, y_test),
-        verbose=1
-    )
+    # Avalia o modelo nos dados de teste
+    test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=1)
     
     print("\n" + "="*80)
-    print("Treinamento do modelo completo.")
+    print("Avaliação completa.")
     print("="*80)
-
-    # Avalia o modelo nos dados de teste
-    test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
-    print(f"\n📊 Resultados Finais:")
+    
+    print(f"\n📊 Resultados Finais (Conjunto de Teste '{TEST_DATA_PATH}'):")
     print(f"   - Loss no conjunto de teste: {test_loss:.4f}")
     print(f"   - Acurácia no conjunto de teste: {test_accuracy:.4f} ({test_accuracy*100:.2f}%)")
 
     # Faz predições no conjunto de teste para gerar gráficos
     print("\n" + "="*80)
-    print("GERANDO VISUALIZAÇÕES")
+    print("GERANDO VISUALIZAÇÕES DE TESTE")
     print("="*80)
     y_pred = model.predict(X_test, verbose=0)
     
     # Gera todos os gráficos
-    plot_training_history(history, timestamp)
     plot_confusion_matrix(y_test, y_pred, timestamp)
     plot_per_class_metrics(y_test, y_pred, timestamp)
-    plot_model_performance_summary(history, y_test, y_pred, timestamp)
-    save_metrics_report(history, y_test, y_pred, timestamp)
+    plot_evaluation_dashboard(y_test, y_pred, test_loss, test_accuracy, timestamp)
+    save_evaluation_report(y_test, y_pred, test_loss, test_accuracy, timestamp)
 
-    # Salva o modelo treinado no formato H5 do Keras (se não foi salvo pelo checkpoint)
-    model.save(KERAS_MODEL_NAME)
-    print(f"\n💾 Modelo salvo como: {KERAS_MODEL_NAME}")
-    print(f"   Tamanho do arquivo: {os.path.getsize(KERAS_MODEL_NAME) / (1024*1024):.2f} MB")
+    print(f"\n✓ Avaliação e geração de relatórios concluídas.")
 
 
 # --- Execução Principal ---
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print("🚀 INICIANDO TREINAMENTO DE MODELO LIBRAS COM WORKERS PARALELOS")
+    print("🚀 INICIANDO AVALIAÇÃO DE MODELO LIBRAS EM DADOS DE TESTE")
     print("="*80)
     print(f"Ações a serem reconhecidas: {', '.join(ACTIONS)}")
     print(f"Comprimento da sequência: {SEQUENCE_LENGTH} frames")
     print(f"Detectores: Pose + Hands (2) + Face")
     print(f"Total de features por frame: 1692")
     print(f"Número de workers: {NUM_WORKERS}")
+    print(f"Dados de teste: ./{TEST_DATA_PATH}")
+    print(f"Modelo: {KERAS_MODEL_NAME}")
     print("="*80 + "\n")
     
-    train_model()
+    evaluate_model()
     
     print("\n" + "="*80)
-    print("✅ --- PROCESSO CONCLUÍDO COM SUCESSO --- ✅")
+    print("✅ --- PROCESSO DE AVALIAÇÃO CONCLUÍDO --- ✅")
     print("="*80)
     print(f"\n📁 Arquivos gerados:")
-    print(f"   - Modelo: {KERAS_MODEL_NAME}")
     print(f"   - Gráficos: ./{RESULTS_DIR}/ (vários arquivos PNG)")
     print(f"   - Relatórios: ./{RESULTS_DIR}/ (JSON e TXT)")
-    print(f"   - Logs: ./Logs/ (visualize com TensorBoard)")
-    print(f"\n💡 Para visualizar o treinamento no TensorBoard, execute:")
-    print(f"   tensorboard --logdir=Logs")
+    print("="*80 + "\n")
